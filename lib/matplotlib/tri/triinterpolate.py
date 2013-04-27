@@ -52,7 +52,7 @@ class TriInterpolator(object):
         self._unit_y = 1.0
 
         # Default triangle renumbering: None (= no renumbering)
-        # Renumbering may be used to avoid unecessary computations
+        # Renumbering may be used to avoid unnecessary computations
         # if complex calculations are done inside the Interpolator.
         # Please refer to :meth:`_interpolate_multikeys` for details.
         self._tri_renum = None
@@ -166,8 +166,8 @@ class TriInterpolator(object):
                              " Given: {0} and {1}".format(x.shape, y.shape))
         x = np.ravel(x)
         y = np.ravel(y)
-        x_scaled = x/self._unit_x
-        y_scaled = y/self._unit_y
+        x_scaled = x / self._unit_x
+        y_scaled = y / self._unit_y
         size_ret = np.size(x_scaled)
 
         # Computes & ravels the element indexes, extract the valid ones.
@@ -508,12 +508,12 @@ class CubicTriInterpolator(TriInterpolator):
         x, y : array-like of dim 1 (shape (nx,))
                   Coordinates of the points whose points barycentric
                   coordinates are requested
-        tris_pts : array like of dim 3 (shape: (nx,3,2))
+        tris_pts : array like of dim 3 (shape: (nx, 3, 2))
                     Coordinates of the containing triangles apexes.
 
         Returns
         -------
-        alpha : array of dim 2 (shape (nx,3))
+        alpha : array of dim 3 (shape (nx, 3, 1))
                  Barycentric coordinates of the points inside the containing
                  triangles.
         """
@@ -598,6 +598,538 @@ class CubicTriInterpolator(TriInterpolator):
         return _to_matrix_vectorized([[(dot_c-dot_b)/dot_a],
                                       [(dot_a-dot_c)/dot_b],
                                       [(dot_b-dot_a)/dot_c]])
+
+
+
+#class _VecCubicTriInterpolator(object):
+#    """
+#    Wrapper around 2 CubicTriInterpolators, to provide fast interpolation of a
+#    2-d vector field.
+#
+#    Parameters:
+#    -----------
+#        triangulation: tri.Triangulation
+#        u: tuple (ux, uy)
+#        trifinder: tri.TriFinder, optional
+#    """
+#    def __init__(self, triangulation, u, trifinder=None):
+
+class _StreamIntegrator(object):
+    """
+    Derivated class to provide streamplots.
+    """
+    def __init__(self, triangulation, u, trifinder=None):
+        
+        if trifinder is not None and not isinstance(trifinder, TriFinder):
+            raise ValueError("Expected a TriFinder object")
+        self._trifinder = trifinder or triangulation.get_trifinder()
+
+        # Computing u scale factors. Some calculations are done twice here (as
+        # also done at CubicTriInterpolator instanciation), but no simple way
+        # to do it otherwise, without changing CubicTriInterpolator __init__
+        # signature.
+        _, compressed_x, compressed_y = TriAnalyzer(triangulation
+            )._get_compressed_triangulation(False, False)
+
+        self._unit_x = (np.max(compressed_x) - np.min(compressed_x))
+        self._unit_y = (np.max(compressed_y) - np.min(compressed_y))
+        kx, ky = (1. / self._unit_x, 1. / self._unit_y)
+        self._k = np.array([[kx, 0.], [0., ky]], dtype=np.float64)
+        self._k_inv = np.array([[self._unit_x, 0.], [0., self._unit_y]],
+                               dtype=np.float64)
+
+        # Initialising the "scaled" interpolators. 
+        ux, uy = u
+        ux = np.asarray(ux, dtype=np.float64)
+        uy = np.asarray(uy, dtype=np.float64)
+        interp_ux = CubicTriInterpolator(
+            triangulation, (ux * kx), trifinder=self._trifinder)
+        interp_uy = CubicTriInterpolator(
+            triangulation, (uy * ky), trifinder=self._trifinder)
+        self._ReferenceElement = _ReducedHCT_Element()
+
+        # Stores the dofs & useful arrays.
+        self._dof_x = interp_ux._dof
+        self._dof_y = interp_uy._dof
+        for attr in ["_triangulation", "_tri_renum", "_tris_pts", "_eccs"]:
+            setattr(self, attr, getattr(interp_ux, attr))
+
+#        # TODO some assertions to check ...
+#        assert (self._tris_pts.ndim == 3)
+#        assert (self._unit_x == interp_ux._unit_x == interp_uy._unit_x)
+#        assert (self._unit_y == interp_ux._unit_y == interp_uy._unit_y)
+
+    def _get_alpha_vec(self, x, y, tri_index):
+        """
+        Fast (vectorized) function to compute barycentric coordinates alpha.
+
+        Parameters
+        ----------
+        x, y : array-like of dim 1 (shape (nx,))
+                  Coordinates of the points whose points barycentric
+                  coordinates are requested
+        tri_index : array like of dim 1 (shape: (nx,))
+                  Containing triangles indices.
+
+        Returns
+        -------
+        alpha : array of dim 2 (shape (nx, 3))
+                 Barycentric coordinates of the points inside the containing
+                 triangles.
+        """
+        tris_pts = self._tris_pts[self._tri_renum[tri_index]]
+        return CubicTriInterpolator._get_alpha_vec(
+            x / self._unit_x, y / self._unit_y, tris_pts)
+
+    def get_dalpha_vec(self, dx, tri_index):
+        """
+        Returns variation of barycentric coordiantes knowing variation that of
+        global coordiantes.
+        """
+        tris_pts = self._tris_pts[self._tri_renum[tri_index]]
+        x = dx[:, 0, 0] + tris_pts[:, 0, 0]
+        y = dx[:, 1, 0] + tris_pts[:, 0, 1]
+        dalpha = CubicTriInterpolator._get_alpha_vec(x, y, tris_pts)
+        dalpha[:, 0, :] = - dalpha[:, 1, :] - dalpha[:, 2, :]
+        return dalpha
+
+    def get_xy_vec(self, alpha, tri_index):
+        """
+        Returns global coordinates knowing barycentric coordinates.
+
+        Parameters
+        ----------
+        alpha : array-like of dim 2 (shape: (n_pts, 3))
+            Barycentric coordinates associated with tri_index triangles.
+        tri_index : array-like of dim 1 (shape: (n_pts,))
+            Indices of the containing triangles
+#        tris_pts : array-like of dim 3 (shape: (n_pts, 3, 2))
+#            Coordinates of the containing triangles apexes.
+
+        Returns
+        -------
+        x, y : array of dim 1 (shape (nx,))
+            Coordinates of the points whose points barycentric
+            coordinates are given
+        """
+        tris_pts = self._tris_pts[tri_index, :, :]
+
+        (n_pts,) = np.shape(tri_index)
+        assert (alpha.shape == (n_pts, 3, 1))
+        assert (tris_pts.shape == (n_pts, 3, 2))
+
+        x = (tris_pts[:, 0, 0] * alpha[:, 0, 0] +
+             tris_pts[:, 1, 0] * alpha[:, 1, 0] +
+             tris_pts[:, 2, 0] * alpha[:, 2, 0])
+        y = (tris_pts[:, 0, 1] * alpha[:, 0, 0] +
+             tris_pts[:, 1, 1] * alpha[:, 1, 0] +
+             tris_pts[:, 2, 1] * alpha[:, 2, 0])
+
+        return x * self._unit_x, y * self._unit_y
+
+    def interpolate_local(self, tri_index, alpha, return_key='u'):
+        """
+        Returns interpolated values of u, du at locations given by triangles
+        and barycentric coordinates. u and du rescaled.
+
+        tri_index must be a flat arrays.
+
+        Parameters:
+        -----------
+        tri_index: integer array of shape (npts,)
+            Indices of the containing triangles.
+        alpha: array of shape (npts, 3)
+            Barycentric coordinates inside the containing triangles.
+
+        Returns:
+        --------
+        u: array of shape (npts, 2, 1)
+            Values of u in local (scaled) coordinates. The scale factor is
+            u = k.U if x = k.X ; hence if dX/dt = U we have also dx/dt = u.
+        du: array of shape (npts, 2, 2)
+            du[; i, j] matrice = dui / dxj
+        """
+        (npts,) = tri_index.shape
+        assert (alpha.shape == (npts, 3, 1))
+
+        ecc = self._eccs[tri_index]
+        dof_x = np.expand_dims(self._dof_x[tri_index], axis=1)
+        dof_y = np.expand_dims(self._dof_y[tri_index], axis=1)
+
+        # Computing u.
+        u = np.empty([npts, 2, 1], dtype=np.float64)
+        u[:, 0, 0] = self._ReferenceElement.get_function_values(
+                alpha, ecc, dof_x)
+        u[:, 1, 0] = self._ReferenceElement.get_function_values(
+                alpha, ecc, dof_y)
+
+        if return_key == 'u':
+            return u
+
+        elif return_key == 'u_du':
+            du = np.empty([npts, 2, 2], dtype=np.float64)
+            tris_pts = self._tris_pts[tri_index]
+            J = CubicTriInterpolator._get_jacobian(tris_pts)
+            du[:, 0, :] = self._ReferenceElement.get_function_derivatives(
+                alpha, J, ecc, dof_x)[:, :, 0]
+            du[:, 1, :] = self._ReferenceElement.get_function_derivatives(
+                alpha, J, ecc, dof_y)[:, :, 0]
+            return u, du
+
+        else:
+            raise ValueError("Expected return_key to be either 'u' or 'du'"
+                             "; found {0}.".format(return_key))
+
+    def interpolate(self, x, y, return_key='u', tri_index=None):
+        """
+        Returns interpolated values of u, du at locations given in global x, y
+        coordinates. x, y must be flat (1-d) arrays.
+        Note: Provided mainly for debugging and testing purpose.
+
+        Parameters:
+        -----------
+        x, y: float array of shape (npts,)
+            Global coordinates of the points locations.
+
+        Returns:
+        --------
+        U: array of shape (npts, 2, 1)
+            Values of U in global (no scale) coordinates
+        dU: array of shape (npts, 2, 2)
+            dU[; i, j] matrice = dUi / dXj
+        """
+        if ((x.ndim != 1) or (y.ndim != 1)):
+            raise ValueError("Expected 1-d x, y arrays ; "
+                             "found {0}-d and {1}-d.".format(x.ndim, y.ndim))
+        npts = x.shape[0]
+        if tri_index is None: tri_index = self._trifinder(x, y)
+
+        # Initialising the mask for points outside the mesh
+        mask_in = (tri_index != -1)
+        if self._tri_renum is None:
+            valid_tri_index = tri_index[mask_in]
+        else:
+            valid_tri_index = self._tri_renum[tri_index[mask_in]]
+
+        # Initialising the return arrays
+        u = np.empty([npts, 2, 1], dtype=np.float64)
+        du = np.empty([npts, 2, 2], dtype=np.float64)
+        u[~mask_in, :, :] = np.nan
+        du[~mask_in, :, :] = np.nan
+
+        valid_x = x[mask_in]
+        valid_y = y[mask_in]
+        valid_alpha = self._get_alpha_vec(valid_x, valid_y, tri_index[mask_in])
+
+        if return_key == 'u':
+            valid_u = self.interpolate_local(
+                valid_tri_index, valid_alpha, 'u')
+            valid_u = _prod_vectorized(self._k_inv, valid_u)
+            u[mask_in, :, :] = valid_u
+            return np.ma.masked_invalid(u, copy=False)
+
+        elif return_key == 'u_du':
+            valid_u, valid_du = self.interpolate_local(
+                valid_tri_index, valid_alpha, 'u_du')
+            valid_u = _prod_vectorized(self._k_inv, valid_u)
+            valid_du = _prod_vectorized(_prod_vectorized(
+                                        self._k_inv, valid_du), self._k)
+            u[mask_in, :, :] = valid_u
+            du[mask_in, :, :] = valid_du
+            return (np.ma.masked_invalid(u, copy=False),
+                    np.ma.masked_invalid(du, copy=False))
+        else:
+            raise ValueError("Expected return_key to be either 'u' or 'du'"
+                             "; found {0}.".format(return_key))
+
+    @staticmethod
+    def lengths(vec):
+        """
+        lengths of a (nvecs, 2, 1) array.
+        """
+        return np.sqrt(np.sum(np.square(vec), axis=1))
+
+#    def walk_streams(self, x0, y0, u0=None, du0=None, lmax=0.1, dt0=None):
+#        """
+#        Provided mainly for debugging purposes
+#        """
+#
+#        if ((x0.ndim != 1) or (y0.ndim != 1)):
+#            raise ValueError("Expected 1-d x0, y0 arrays ; found"
+#                             " {0}-d and {1}-d.".format(x0.ndim, y0.ndim))
+#        npts = x0.shape[0]
+#        tri_index0 = self._trifinder(x0, y0)
+#
+#        # Initialising the mask for points outside the mesh
+#        mask_in = (tri_index0 != -1)
+#        if not(np.all(mask_in)):
+#            raise ValueError("All points should be inside the mesh ; found "
+#                             "outside: {0}".format(np.argwhere(
+#                                                   tri_index0 == -1)))
+#
+##        if self._tri_renum is None:
+##            valid_tri_index0 = tri_index0
+##        else:
+##            valid_tri_index0 = self._tri_renum[tri_index0]
+#
+#        #tris_pts0 = self._tris_pts[valid_tri_index0]
+#        alpha0 = self._get_alpha_vec(x0, y0, tri_index0, True)
+#
+#        (tri_index1, alpha1, u1, du1, t1, flag_stagnate, flag_frontier
+#         ) = self.walk_streams_local(tri_index0, alpha0,
+#                                     u0, du0, lmax, dt0)
+#
+#        # TODO check if shall renumber here ...
+##        tris_pts1 = self._tris_pts[tri_index1]
+#        x1, y1 = self.get_xy_vec(alpha1, tri_index1)
+#
+#        return (x1, y1, u1, du1, t1, flag_stagnate, flag_frontier)
+
+
+    def walk_streams_local(self, tri_index0, alpha0, u0=None, du0=None, lmax=0.1,
+                           dt0=None):
+        """
+        Walk one time step along u field, starting at given locations.
+
+        If a time step dt0 is not provided, it will be initialized so that
+        stepsize is approx lmax.
+        Loop on time step will occur until the step is validated i.e.: 
+            - error below error_max.
+            - length < lmax
+
+        Termination of the path should occur if:
+            - the point is at the domain frontier (flag flag_frontier)
+            - the point is stagnating (flag flag_stagnate
+
+        Parameters:
+        -----------
+        tri_index0: integer array of shape (npts, 1, 1)
+            Point containing triangles.
+        alpha0: array of shape (npts, 3, 1)
+            Point barycentic coordinates.
+        u0: array of shape (npts, 2, 1), optional
+            Vector coordinates.
+        du0: array of shape (npts, 2, 2), optional
+            Vector gradient.
+        lmax: float
+            Maximal length for each step.
+        dt0: 1d-array of shape (npts,), optionnal
+            Proposal for time step
+
+        Returns:
+        --------
+        tri_index1, alpha1, u1, du1, dt1: arrays
+            Arrays of same shape as theirs "0" counterparts, updated versions
+            of the input arrays.
+        flag_stagnate: boolean array of shape (npts,)
+            Indentification of stagnating streams.
+        flag_frontier:
+            Indentification of streams which have reached the mesh frontier.
+        
+        """
+        npts = tri_index0.shape[0]
+        # Sanity checks
+        assert tri_index0.shape == (npts,)
+        assert alpha0.shape == (npts, 3, 1)
+
+        # u values & gradient ; v0 = d2x/dt2
+        if u0 is None:
+            u0, du0 = self.interpolate_local(tri_index0, alpha0, return_key=('u_du'))
+        else:
+            assert u0.shape == (npts, 2, 1)
+            assert du0.shape == (npts, 2, 2)
+        v0 = _prod_vectorized(du0, u0)
+
+        # dt0 for a step <= lmax * 0.8
+        if dt0 is None:
+            dt0 = np.empty([npts, 2], dtype=np.float64)
+            dt0[:, 0] = lmax / self.lengths(u0[:, :, 0]) * 0.5 # first order
+            dt0[:, 1] = np.sqrt(lmax / self.lengths(v0[:, :, 0])) # second order
+            dt0 = np.nanmin(dt0, axis=1) * 0.8
+#        print( dt0)
+
+        # Initializing arrays for the convergence loop
+        dt1 = np.copy(dt0)
+        converged = np.zeros(npts, dtype=np.bool)
+        dx = np.empty([npts, 2, 1], dtype=np.float64)
+        dalpha = np.empty([npts, 3, 1], dtype=np.float64)
+        alpha1 = np.empty([npts, 3, 1], dtype=np.float64)
+        tri_index1 = np.empty([npts], dtype=np.int32)
+        u1 = np.empty([npts, 2, 1], dtype=np.float64)
+        du1 = np.empty([npts, 2, 2], dtype=np.float64)
+
+        flag_frontier = np.zeros(npts, dtype=np.bool)
+        flag_stagnate = np.zeros(npts, dtype=np.bool)
+        
+        length = np.empty([npts], dtype=np.float64)
+        dt_length = np.empty([npts], dtype=np.float64)
+        length_ko = np.zeros(npts, dtype=np.bool)
+        
+        error = np.empty([npts], dtype=np.float64)
+        dt_error = np.empty([npts], dtype=np.float64)
+        error_ko = np.zeros(npts, dtype=np.bool)
+
+        while not(np.all(converged)):
+            uc = ~converged
+            # 2nd order Taylor in global coordinates.
+            print( uc.shape, dt1.shape)
+            dt1_loc = dt1[uc][:, np.newaxis, np.newaxis]
+            dx[uc, : , :] = (u0[uc, : , :] * dt1_loc + 
+                             0.5 * v0[uc, : , :] * dt1_loc**2)
+#            # Fast computation of the new barycentric coordinates
+            dalpha[uc, :, :] = self.get_dalpha_vec(dx[uc, :, :],
+                                                   tri_index0[uc])
+            alpha1[uc, :, :] = alpha0[uc, :, :] + dalpha[uc, :, :]
+            # Change reference triangle if necessary
+            tri_index1[uc], alpha1[uc, :, :] = self.find_new_tri(
+                tri_index0[uc], alpha1[uc])
+
+            # Check step length smaller than lmax:
+            length[uc] = self.lengths(dx[uc, :, :])
+#            length_ko[uc] = (length[uc] > lmax)
+#            dt_length[length_ko] = lmax / length[length_ko] * 0.85
+            flag_stagnate[uc] = (length[uc] < lmax * 0.001)
+            # There is a special case, as a border point that still has a neighbor
+            # cannot be considered as stagnating
+            #if np.any(out_mesh):
+
+            # If we are out of the mesh, make a shorter step to the triangle border.
+            out_mesh = (tri_index1 == -1)
+#            print("out_mesh", out_mesh)
+            if np.any(out_mesh):
+                (dt1[out_mesh], alpha1[out_mesh], tri_index1[out_mesh],
+                 has_neigh) = self.walk_to_border(alpha0[out_mesh],
+                                                  dalpha[out_mesh] / dt1_loc[out_mesh],
+                                                  tri_index0[out_mesh])
+                flag_frontier[out_mesh] = ~has_neigh
+
+                    
+#                    tri_index1[out_mesh][no_neigh] = tri_index0[out_mesh][no_neigh]
+#            print ("length_ko", length_ko)
+
+            # Check convergence
+            error_max = 0.01
+            u1[uc, :, :], du1[uc, :, :] = self.interpolate_local(
+                tri_index1[uc, :, :], alpha1[uc, :, :], 'u_du')
+            error_vec = u1[uc, :, :] - (u0[uc, :, :] + v0[uc, :, :] * dt1[uc])
+#            print ('error_vec', error_vec)
+            error[uc] = self.lengths(error_vec)
+#            print ("tri_index1[uc, :, :]", tri_index1[uc, :, :])
+#            print ("u1[uc, :, :]", u1[uc, :, :])
+#            print ("du1[uc, :, :]", du1[uc, :, :])
+            
+            # Debug: verif
+#            print ("_k_inv", self._k_inv)
+#            x1, y1 = self.get_xy_vec(alpha1, tri_index1)
+#            print ("x1, y1", x1, y1)
+#            u1_, du1_ = self.interpolate(x1, y1,'u_du')
+#            print ("u1_, du1_", u1_, du1_)
+            
+
+            error_ko[uc] = (error[uc] > error_max)
+            print ("error_ko", error_ko)
+            if np.any(error_ko):
+                dt_error[error_ko] = 0.85 * dt1[error_ko] * np.sqrt(error_max / error[error_ko])
+
+            # Updates time step for still not convergend pathes
+            l_ko = (length_ko & ~error_ko)
+            e_ko = (~length_ko & error_ko)
+            el_ko = (length_ko & error_ko)
+            dt1[l_ko] = dt_length[l_ko]
+            dt1[e_ko] = dt_error[e_ko]
+            dt1[el_ko] = np.where(dt_length[el_ko] < dt_error[el_ko], 
+                                dt_length[el_ko], dt_error[el_ko])
+            converged = (~length_ko & ~error_ko)
+
+            #raise RuntimeError()            
+        # Next time
+        #dt1 = 0.85 * dt1 * np.sqrt(error_max / error)
+#        print ("tri_index1 *2", tri_index1)
+#        print ("alpha1 *2", alpha1)
+        return tri_index1, alpha1, u1, du1, dt1, flag_stagnate, flag_frontier
+
+
+    def find_new_tri(self, tri_index, alpha):
+        """
+        Returns a valid set of barcentric coordinates.
+
+        Parameters:
+        -----------
+        tri_index
+        alpha
+
+        Returns:
+        --------
+        tri_index
+        alpha
+        """
+        out_tri = (np.min(alpha, axis=1) < 0)[:, 0]
+        if np.any(out_tri):
+            # TODO il doit y avoir une transposition a faire la...
+            out_x, out_y = self.get_xy_vec(
+                alpha[out_tri, :], tri_index[out_tri])
+            tri_index[out_tri] = self._trifinder(out_x, out_y)
+            alpha[out_tri, : , :] = self._get_alpha_vec(
+                out_x, out_y, tri_index[out_tri])
+
+        return tri_index, alpha
+
+    def walk_to_border(self, alpha, dalpha, tri_index):
+        """
+        Step to the next border... knowing dalpha.
+
+        Parameters:
+        -----------
+        alpha: initial barycentric coordinates
+        dalpha: derivatives
+        tri_index: initial triangle index
+
+        Returns:
+        --------
+        dt: array of shape (npts,)
+            time step
+        alpha_new: array of shape (npts,)
+            new barycentric coordinates.
+        tri_index_new: new triangle index. Change if possible for neighbor.
+        has_neigh: boolean array
+        """
+        npts = alpha.shape[0]
+        # Sanity checks
+        assert alpha.shape == (npts, 3, 1)
+        assert dalpha.shape == (npts, 3, 1)
+        assert tri_index.shape == (npts,)
+
+        # Computes dt for a linear evolution.
+        dt = np.empty([npts, 3], dtype=np.float64)
+        for iside in [0, 1, 2]:
+            dt[:, iside] = - alpha[:, iside, 0] / dalpha[:, iside, 0]
+        dt = np.ma.masked_where(dt <= 0, dt, copy=False)
+        side = np.argmin(dt, axis=1)  # side for 1st intersection
+        dt = dt[np.arange(npts), side]
+
+        alpha_new = (alpha + dalpha * dt[:, np.newaxis, np.newaxis])
+        assert alpha_new.shape == (npts, 3, 1)
+
+        # Changes triangle for its neighbor if possible...
+        tn = self._triangulation.neighbors
+        neigh = tn[tri_index, (side+1) % 3]
+        has_neigh = (neigh != -1)
+        if np.any(has_neigh):
+            where_neigh = np.argwhere(has_neigh).ravel()
+            tri_index_new = np.copy(tri_index)
+            a1 = alpha_new[where_neigh, (side[where_neigh]+1) % 3, 0]
+            a2 = alpha_new[where_neigh, (side[where_neigh]+2) % 3, 0]
+            diff_table = np.abs(tn[neigh[has_neigh], :] -
+                                tri_index[has_neigh][:, np.newaxis])
+            neigh_side = np.argmin(diff_table, axis=1)
+            alpha_new[where_neigh, (neigh_side+2) % 3, 0] = 0.
+            alpha_new[where_neigh, (neigh_side+1) % 3, 0] = a1
+            alpha_new[where_neigh, neigh_side, 0] = a2
+            tri_index_new[has_neigh] = neigh[has_neigh]
+        else:
+            tri_index_new = tri_index
+
+        return dt, alpha_new, tri_index_new, has_neigh
 
 
 # FEM element used for interpolation and for solving minimisation
